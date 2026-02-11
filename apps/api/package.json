@@ -5,7 +5,10 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
-    "build": "tsc -p tsconfig.json",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/**/*.test.js",
+    "build": "npm run build:shared && tsc -p tsconfig.json",
+    "build:shared": "npm --prefix ../../packages/shared run build",
     "start": "node dist/index.js",
     "prisma:generate": "node scripts/prisma-with-env.cjs generate",
     "prisma:migrate": "node scripts/prisma-with-env.cjs migrate dev",
