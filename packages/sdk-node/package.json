@@ -1,14 +1,34 @@
 {
   "name": "@ochqich/sdk-node",
-  "version": "1.0.0",
-  "private": true,
+  "version": "1.1.0",
+  "description": "Official Node.js SDK for Ochiqich consent APIs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "scripts": {
-    "build": "tsc -p tsconfig.json"
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
   },
-  "dependencies": {
-    "@ochqich/shared": "file:../shared"
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "ochiqich",
+    "sdk",
+    "consent",
+    "node"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
   },
   "devDependencies": {
     "@types/node": "^20.16.10",
