@@ -15,6 +15,8 @@ export const config = {
   databaseUrl: process.env.DATABASE_URL!,
   jwtSecret: process.env.JWT_SECRET!,
   accessTokenTtlSeconds: 15 * 60,
+  registrationTokenTtlSeconds: 15 * 60,
   challengeTtlSeconds: 60,
+  otpTtlSeconds: 300,
   refreshTokenTtlDays: 30,
 };

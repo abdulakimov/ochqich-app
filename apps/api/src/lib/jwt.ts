@@ -7,12 +7,27 @@ export interface AccessTokenPayload {
   sessionId: string;
 }
 
+export interface RegistrationTokenPayload {
+  sub: string;
+  type: "registration";
+}
+
 export function signAccessToken(payload: AccessTokenPayload): string {
   return jwt.sign(payload, config.jwtSecret, {
     expiresIn: config.accessTokenTtlSeconds,
   });
 }
 
-export function verifyAccessToken(token: string): AccessTokenPayload {
-  return jwt.verify(token, config.jwtSecret) as AccessTokenPayload;
+export function signRegistrationToken(userId: string): string {
+  return jwt.sign(
+    { sub: userId, type: "registration" satisfies RegistrationTokenPayload["type"] },
+    config.jwtSecret,
+    {
+      expiresIn: config.registrationTokenTtlSeconds,
+    },
+  );
+}
+
+export function verifyToken(token: string): AccessTokenPayload | RegistrationTokenPayload {
+  return jwt.verify(token, config.jwtSecret) as AccessTokenPayload | RegistrationTokenPayload;
 }

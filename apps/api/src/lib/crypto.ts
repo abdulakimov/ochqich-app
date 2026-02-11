@@ -8,6 +8,10 @@ export function generateRefreshToken(): string {
   return crypto.randomBytes(48).toString("base64url");
 }
 
+export function generateOtpCode(): string {
+  return `${crypto.randomInt(0, 1_000_000)}`.padStart(6, "0");
+}
+
 export function hashToken(rawToken: string): string {
   return crypto.createHash("sha256").update(rawToken).digest("hex");
 }
