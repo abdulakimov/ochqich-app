@@ -7,9 +7,9 @@
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "prisma:generate": "prisma generate",
-    "prisma:migrate": "prisma migrate dev",
-    "prisma:deploy": "prisma migrate deploy"
+    "prisma:generate": "node scripts/prisma-with-env.cjs generate",
+    "prisma:migrate": "node scripts/prisma-with-env.cjs migrate dev",
+    "prisma:deploy": "node scripts/prisma-with-env.cjs migrate deploy"
   },
   "dependencies": {
     "@ochqich/shared": "file:../../packages/shared",
