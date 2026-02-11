@@ -20,6 +20,9 @@ import { requireAuth } from "../middleware/auth";
 
 export const v1Router = Router();
 
+const MAX_ACTIVE_DEVICES = 2;
+const ACTIVE_DEVICE_LIMIT_MESSAGE = `ACTIVE device limit reached (max ${MAX_ACTIVE_DEVICES})`;
+
 v1Router.post("/devices/register", async (req, res) => {
   const parsed = registerDeviceSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -44,14 +47,31 @@ v1Router.post("/devices/register", async (req, res) => {
   });
 
   if (existingDevice && existingDevice.status === DeviceStatus.REVOKED) {
-    const revived = await prisma.device.update({
-      where: { id: existingDevice.id },
-      data: {
-        status: DeviceStatus.ACTIVE,
-        publicKey,
-        deviceName,
-      },
+    const revived = await prisma.$transaction(async (tx) => {
+      const activeCount = await tx.device.count({
+        where: {
+          userId: user.id,
+          status: DeviceStatus.ACTIVE,
+        },
+      });
+
+      if (activeCount >= MAX_ACTIVE_DEVICES) {
+        return null;
+      }
+
+      return tx.device.update({
+        where: { id: existingDevice.id },
+        data: {
+          status: DeviceStatus.ACTIVE,
+          publicKey,
+          deviceName,
+        },
+      });
     });
+
+    if (!revived) {
+      return res.status(409).json({ message: ACTIVE_DEVICE_LIMIT_MESSAGE });
+    }
 
     await writeAuditLog({
       action: "DEVICE_ADD",
@@ -74,8 +94,8 @@ v1Router.post("/devices/register", async (req, res) => {
     },
   });
 
-  if (activeCount >= 2) {
-    return res.status(409).json({ message: "ACTIVE device limit reached (max 2)" });
+  if (activeCount >= MAX_ACTIVE_DEVICES) {
+    return res.status(409).json({ message: ACTIVE_DEVICE_LIMIT_MESSAGE });
   }
 
   const device = await prisma.device.create({
@@ -198,31 +218,56 @@ v1Router.post("/auth/confirm", async (req, res) => {
     Date.now() + config.refreshTokenTtlDays * 24 * 60 * 60 * 1000,
   );
 
-  const session = await prisma.$transaction(async (tx) => {
-    await tx.authChallenge.update({
-      where: { id: challenge.id },
-      data: {
-        status: ChallengeStatus.USED,
-        usedAt: new Date(),
-      },
+  let accessToken: string;
+
+  try {
+    const session = await prisma.$transaction(async (tx) => {
+      const consumeResult = await tx.authChallenge.updateMany({
+        where: {
+          id: challenge.id,
+          status: ChallengeStatus.PENDING,
+          expiresAt: { gte: new Date() },
+        },
+        data: {
+          status: ChallengeStatus.USED,
+          usedAt: new Date(),
+        },
+      });
+
+      if (consumeResult.count !== 1) {
+        throw new Error("challenge_not_pending");
+      }
+
+      return tx.session.create({
+        data: {
+          userId: challenge.device.userId,
+          deviceId: challenge.device.id,
+          refreshTokenHash,
+          expiresAt: refreshExpiresAt,
+          status: SessionStatus.ACTIVE,
+        },
+      });
     });
 
-    return tx.session.create({
-      data: {
+    accessToken = signAccessToken({
+      sub: challenge.device.userId,
+      deviceId: challenge.device.id,
+      sessionId: session.id,
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === "challenge_not_pending") {
+      await writeAuditLog({
+        action: "LOGIN_FAIL",
         userId: challenge.device.userId,
         deviceId: challenge.device.id,
-        refreshTokenHash,
-        expiresAt: refreshExpiresAt,
-        status: SessionStatus.ACTIVE,
-      },
-    });
-  });
+        metadata: { reason: "challenge_not_pending" },
+      });
 
-  const accessToken = signAccessToken({
-    sub: challenge.device.userId,
-    deviceId: challenge.device.id,
-    sessionId: session.id,
-  });
+      return res.status(409).json({ message: "Challenge already used or expired" });
+    }
+
+    throw error;
+  }
 
   await writeAuditLog({
     action: "LOGIN_OK",
