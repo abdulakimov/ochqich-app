@@ -29,6 +29,22 @@ export const refreshSchema = z.object({
   refreshToken: z.string().min(16),
 });
 
+const attributeSchema = z.string().min(1).max(128);
+
+export const createConsentRequestSchema = z.object({
+  userId: z.string().min(5).optional(),
+  requestedAttributes: z.array(attributeSchema).min(1),
+  expiresAt: z.coerce.date().optional(),
+});
+
+export const approveConsentSchema = z.object({
+  approvedAttributes: z.array(attributeSchema).min(1),
+});
+
+export const denyConsentSchema = z.object({
+  deniedAttributes: z.array(attributeSchema).min(1).optional(),
+});
+
 export function zodErrorPayload(error: ZodError) {
   return {
     message: "Validation failed",
