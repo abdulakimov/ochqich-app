@@ -1,11 +1,11 @@
-import { AuditAction } from "@prisma/client";
+import { AuditAction, Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 
 export async function writeAuditLog(params: {
   action: AuditAction;
   userId?: string;
   deviceId?: string;
-  metadata?: Record<string, unknown>;
+  metadata?: Prisma.InputJsonValue;
 }) {
   await prisma.auditLog.create({
     data: {
