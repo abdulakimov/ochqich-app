@@ -25,6 +25,7 @@ COPY --from=builder /app/apps/api/dist ./apps/api/dist
 COPY --from=builder /app/apps/api/prisma ./apps/api/prisma
 COPY --from=builder /app/apps/api/scripts ./apps/api/scripts
 COPY --from=builder /app/apps/api/node_modules/.prisma ./apps/api/node_modules/.prisma
+COPY --from=builder /app/apps/api/node_modules/prisma ./apps/api/node_modules/prisma
 COPY --from=builder /app/packages/shared/dist ./packages/shared/dist
 
 EXPOSE 3000
