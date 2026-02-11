@@ -1,12 +1,9 @@
-FROM node:20-bookworm-slim
+FROM node:20-alpine
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y openssl ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
-
 COPY package.json package-lock.json* ./
-RUN npm ci
+RUN npm install
 
 COPY . .
 RUN npm run prisma:generate && npm run build

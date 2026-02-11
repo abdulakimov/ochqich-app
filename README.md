@@ -1,135 +1,84 @@
-# Ochqich Auth Core MVP
+# Ochiqich Monorepo
 
-Node.js + TypeScript + Express + Prisma + PostgreSQL asosidagi auth core MVP.
+Ochiqich loyihasi uchun monorepo tuzilmasi:
 
-## Features
+- `apps/api` — Node.js + TypeScript + Express + Prisma
+- `apps/dashboard` — Next.js + TypeScript
+- `apps/mobile` — Flutter
+- `packages/shared` — umumiy types, zod schema va utils
+- `packages/sdk-node` — integratorlar uchun Node SDK
 
-- Device registry (`max 2 ACTIVE` devices per user, otherwise `409`).
-- Challenge-response login (Ed25519 signature verification).
-- JWT access token (`15m`) va refresh token (DB'da faqat hash).
-- Refresh token rotation.
-- Device revoke + o'sha device sessiyalarini revoke qilish.
-- Audit loglar: `LOGIN_OK`, `LOGIN_FAIL`, `DEVICE_ADD`, `DEVICE_REVOKE`.
-- Request validation (`zod`).
+## Strukturasi
 
-## Stack
+```txt
+apps/
+  api/
+  dashboard/
+  mobile/
+packages/
+  shared/
+  sdk-node/
+```
 
-- Node.js 20
-- TypeScript
-- Express
-- Prisma
-- PostgreSQL
-- Docker Compose
+## Talablar
 
-## Quick start
+- Node.js 20+
+- npm 10+
+- Docker (Postgres uchun)
+- Flutter SDK (mobile uchun)
 
-1. Env fayl yarating:
+## Ishga tushirish
+
+1. Root env faylni yarating:
 
 ```bash
 cp .env.example .env
 ```
 
-2. Servislarni ishga tushiring:
+2. Postgresni ishga tushiring:
 
 ```bash
-docker compose up --build
+docker compose up -d postgres
 ```
 
-3. Migratsiyani apply qiling (agar app ichida auto apply bo'lmasa):
-
-```bash
-docker compose exec app npm run prisma:deploy
-```
-
-4. Local development uchun:
+3. Workspace dependencylarni o'rnating:
 
 ```bash
 npm install
+```
+
+4. Prisma client generate qiling va migration yuboring:
+
+```bash
 npm run prisma:generate
 npm run prisma:deploy
-npm run dev
 ```
 
-## API endpoints
-
-- `POST /v1/devices/register`
-- `POST /v1/auth/challenge`
-- `POST /v1/auth/confirm`
-- `POST /v1/auth/refresh`
-- `POST /v1/devices/:id/revoke`
-
-## Minimal curl flow
-
-### 1) Device register
+5. API ni ishga tushiring:
 
 ```bash
-curl -X POST http://localhost:3000/v1/devices/register \
-  -H "Content-Type: application/json" \
-  -d '{
-    "phone":"+998901112233",
-    "fingerprint":"ios-17-iphone15-pro-abc123",
-    "publicKey":"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAu...\n-----END PUBLIC KEY-----",
-    "deviceName":"iPhone 15 Pro"
-  }'
+npm run dev:api
 ```
 
-### 2) Challenge olish
+6. Dashboard ni alohida terminalda ishga tushiring:
 
 ```bash
-curl -X POST http://localhost:3000/v1/auth/challenge \
-  -H "Content-Type: application/json" \
-  -d '{"deviceId":"<DEVICE_ID>"}'
+npm run dev:dashboard
 ```
 
-Javobdan `nonce` va `challengeId`ni oling.
-
-### 3) Clientda nonce sign qilish (Ed25519, demo)
+7. Flutter app:
 
 ```bash
-# private key misoli (test uchun)
-openssl genpkey -algorithm Ed25519 -out ed25519-private.pem
-openssl pkey -in ed25519-private.pem -pubout -out ed25519-public.pem
-
-# nonce qiymatini sign qilish
-printf '%s' '<NONCE>' | openssl pkeyutl -sign -inkey ed25519-private.pem -rawin | base64
+cd apps/mobile
+flutter pub get
+flutter run
 ```
 
-### 4) Confirm login
+## Muhim scriptlar
 
-```bash
-curl -X POST http://localhost:3000/v1/auth/confirm \
-  -H "Content-Type: application/json" \
-  -d '{
-    "challengeId":"<CHALLENGE_ID>",
-    "signature":"<BASE64_SIGNATURE>"
-  }'
-```
-
-### 5) Refresh
-
-```bash
-curl -X POST http://localhost:3000/v1/auth/refresh \
-  -H "Content-Type: application/json" \
-  -d '{"refreshToken":"<REFRESH_TOKEN>"}'
-```
-
-### 6) Device revoke
-
-```bash
-curl -X POST http://localhost:3000/v1/devices/<DEVICE_ID>/revoke \
-  -H "Authorization: Bearer <ACCESS_TOKEN>"
-```
-
-## Prisma models
-
-- `User`
-- `Device`
-- `AuthChallenge`
-- `Session`
-- `AuditLog`
-
-## Notes
-
-- Access token payload: `sub(userId)`, `deviceId`, `sessionId`.
-- `AuthChallenge` TTL: `60s`.
-- Refresh token hash: SHA-256.
+- `npm run dev:api`
+- `npm run dev:dashboard`
+- `npm run build`
+- `npm run prisma:generate`
+- `npm run prisma:migrate`
+- `npm run prisma:deploy`

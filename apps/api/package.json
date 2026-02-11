@@ -1,5 +1,5 @@
 {
-  "name": "ochqich-auth-core",
+  "name": "@ochqich/api",
   "version": "1.0.0",
   "private": true,
   "main": "dist/index.js",
@@ -12,6 +12,7 @@
     "prisma:deploy": "prisma migrate deploy"
   },
   "dependencies": {
+    "@ochqich/shared": "file:../../packages/shared",
     "@prisma/client": "^5.20.0",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
