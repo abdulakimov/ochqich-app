@@ -29,19 +29,31 @@ Node.js + TypeScript + Express + Prisma + PostgreSQL asosidagi auth core MVP.
 cp .env.example .env
 ```
 
-2. Servislarni ishga tushiring:
+2. Docker orqali PostgreSQL'ni ishga tushiring:
+
+```bash
+docker compose up -d postgres
+```
+
+3. App image'ini clean build qiling (Prisma generate + build container ichida bajariladi):
+
+```bash
+docker compose build --no-cache app
+```
+
+4. Migratsiyani app container ichida deploy qiling:
+
+```bash
+docker compose run --rm app npx prisma migrate deploy
+```
+
+5. App + postgres'ni birga ishga tushiring:
 
 ```bash
 docker compose up --build
 ```
 
-3. Migratsiyani apply qiling (agar app ichida auto apply bo'lmasa):
-
-```bash
-docker compose exec app npm run prisma:deploy
-```
-
-4. Local development uchun:
+6. Local development uchun:
 
 ```bash
 npm install
