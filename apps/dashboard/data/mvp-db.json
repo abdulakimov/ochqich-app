@@ -1,0 +1,11 @@
+{
+  "providerSettings": {
+    "name": "Demo Provider",
+    "redirectUri": "https://example.com/callback",
+    "webhookUrl": "https://example.com/webhook",
+    "apiKey": "demo-api-key",
+    "updatedAt": "2026-02-11T10:30:03.985Z"
+  },
+  "consentRequests": [],
+  "webhookLogs": []
+}
