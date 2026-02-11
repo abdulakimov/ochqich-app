@@ -44,6 +44,18 @@ enum AuditAction {
   CONSENT_RESULT_FETCH
   CONSENT_WEBHOOK_SENT
   CONSENT_WEBHOOK_FAIL
+  RECOVERY_CODE_GENERATE
+  RECOVERY_CODE_USE_OK
+  RECOVERY_CODE_USE_FAIL
+  RECOVERY_OTP_START
+  RECOVERY_OTP_VERIFY_OK
+  RECOVERY_OTP_VERIFY_FAIL
+  RECOVERY_RATE_LIMIT_HIT
+}
+
+enum OtpPurpose {
+  AUTH
+  RECOVERY
 }
 
 model User {
@@ -55,6 +67,7 @@ model User {
   sessions        Session[]
   auditLogs       AuditLog[]
   consentRequests ConsentRequest[]
+  recoveryCodes   RecoveryCode[]
 }
 
 model Provider {
@@ -69,14 +82,26 @@ model Provider {
 }
 
 model OtpVerification {
-  id         String   @id @default(cuid())
+  id         String     @id @default(cuid())
   phone      String
   otpHash    String
+  purpose    OtpPurpose @default(AUTH)
   expiresAt  DateTime
   verifiedAt DateTime?
-  createdAt  DateTime @default(now())
+  createdAt  DateTime   @default(now())
 
-  @@index([phone, expiresAt])
+  @@index([phone, purpose, expiresAt])
+}
+
+model RecoveryCode {
+  id        String   @id @default(cuid())
+  userId    String
+  codeHash  String   @unique
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, usedAt])
 }
 
 model Device {
