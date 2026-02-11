@@ -1,4 +1,11 @@
-import { AuditAction, ChallengeStatus, DeviceStatus, Prisma, SessionStatus } from "@prisma/client";
+import {
+  AuditAction,
+  ChallengeStatus,
+  ConsentRequestStatus,
+  DeviceStatus,
+  Prisma,
+  SessionStatus,
+} from "@prisma/client";
 import { Router } from "express";
 import { config } from "../config";
 import { writeAuditLog } from "../lib/audit";
@@ -12,8 +19,11 @@ import {
 import { signAccessToken, signRegistrationToken } from "../lib/jwt";
 import { prisma } from "../lib/prisma";
 import {
+  approveConsentSchema,
   challengeSchema,
   confirmSchema,
+  createConsentRequestSchema,
+  denyConsentSchema,
   refreshSchema,
   registerDeviceSchema,
   registerOtpSchema,
@@ -28,6 +38,80 @@ class HttpError extends Error {
     public readonly message: string,
   ) {
     super(message);
+  }
+}
+
+function getProviderApiKey(headers: Record<string, string | string[] | undefined>): string | null {
+  const explicitApiKey = headers["x-api-key"];
+  if (typeof explicitApiKey === "string" && explicitApiKey.trim().length > 0) {
+    return explicitApiKey.trim();
+  }
+
+  const authHeader = headers.authorization;
+  if (typeof authHeader === "string" && authHeader.startsWith("ApiKey ")) {
+    const token = authHeader.slice("ApiKey ".length).trim();
+    return token.length > 0 ? token : null;
+  }
+
+  return null;
+}
+
+function toUniqueAttributes(attributes: string[]): string[] {
+  return [...new Set(attributes.map((item) => item.trim()).filter((item) => item.length > 0))];
+}
+
+async function dispatchConsentWebhook(consentRequestId: string): Promise<void> {
+  const payload = await prisma.consentRequest.findUnique({
+    where: { id: consentRequestId },
+    include: {
+      provider: true,
+      decision: true,
+    },
+  });
+
+  if (!payload?.provider.webhookUrl || !payload.decision) {
+    return;
+  }
+
+  try {
+    const response = await fetch(payload.provider.webhookUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        consentRequestId: payload.id,
+        providerId: payload.providerId,
+        userId: payload.userId,
+        status: payload.status,
+        requestedAttributes: payload.requestedAttributes,
+        decision: {
+          approvedAttributes: payload.decision.approvedAttributes,
+          deniedAttributes: payload.decision.deniedAttributes,
+          decidedAt: payload.decision.decidedAt.toISOString(),
+        },
+      }),
+    });
+
+    await writeAuditLog({
+      action: AuditAction.CONSENT_WEBHOOK_SENT,
+      userId: payload.userId ?? undefined,
+      metadata: {
+        consentRequestId: payload.id,
+        providerId: payload.providerId,
+        webhookUrl: payload.provider.webhookUrl,
+        statusCode: response.status,
+      },
+    });
+  } catch (error) {
+    await writeAuditLog({
+      action: AuditAction.CONSENT_WEBHOOK_FAIL,
+      userId: payload.userId ?? undefined,
+      metadata: {
+        consentRequestId: payload.id,
+        providerId: payload.providerId,
+        webhookUrl: payload.provider.webhookUrl,
+        error: error instanceof Error ? error.message : "unknown_error",
+      },
+    });
   }
 }
 
@@ -392,6 +476,314 @@ v1Router.post("/auth/refresh", async (req, res) => {
   });
 
   return res.status(200).json({ accessToken, refreshToken: nextRefreshToken });
+});
+
+v1Router.post("/provider/consent-requests", async (req, res) => {
+  const apiKey = getProviderApiKey(req.headers);
+  if (!apiKey) {
+    return res.status(401).json({ message: "Missing provider apiKey" });
+  }
+
+  const parsed = createConsentRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json(zodErrorPayload(parsed.error));
+  }
+
+  const provider = await prisma.provider.findUnique({ where: { apiKey } });
+  if (!provider) {
+    return res.status(401).json({ message: "Invalid provider apiKey" });
+  }
+
+  const requestedAttributes = toUniqueAttributes(parsed.data.requestedAttributes);
+  if (requestedAttributes.length === 0) {
+    return res.status(400).json({ message: "At least one requested attribute is required" });
+  }
+
+  const expiresAt = parsed.data.expiresAt ?? new Date(Date.now() + 10 * 60 * 1000);
+  if (expiresAt <= new Date()) {
+    return res.status(400).json({ message: "expiresAt must be in the future" });
+  }
+
+  if (parsed.data.userId) {
+    const user = await prisma.user.findUnique({ where: { id: parsed.data.userId } });
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+  }
+
+  const consentRequest = await prisma.consentRequest.create({
+    data: {
+      providerId: provider.id,
+      userId: parsed.data.userId,
+      requestedAttributes,
+      expiresAt,
+      token: generateNonce(),
+      status: ConsentRequestStatus.PENDING,
+    },
+  });
+
+  const consentUrl = `${provider.redirectUri.replace(/\/$/, "")}/consent/${consentRequest.id}?token=${encodeURIComponent(consentRequest.token)}`;
+  const qrText = `ochqich://consent/${consentRequest.id}?token=${encodeURIComponent(consentRequest.token)}`;
+
+  await writeAuditLog({
+    action: AuditAction.CONSENT_REQUEST_CREATE,
+    userId: consentRequest.userId ?? undefined,
+    metadata: {
+      consentRequestId: consentRequest.id,
+      providerId: provider.id,
+      requestedAttributes,
+      expiresAt: consentRequest.expiresAt.toISOString(),
+    },
+  });
+
+  return res.status(201).json({
+    consentRequestId: consentRequest.id,
+    status: consentRequest.status,
+    expiresAt: consentRequest.expiresAt.toISOString(),
+    consentUrl,
+    qrText,
+  });
+});
+
+v1Router.get("/provider/consent-requests/:id", async (req, res) => {
+  const apiKey = getProviderApiKey(req.headers);
+  if (!apiKey) {
+    return res.status(401).json({ message: "Missing provider apiKey" });
+  }
+
+  const provider = await prisma.provider.findUnique({ where: { apiKey } });
+  if (!provider) {
+    return res.status(401).json({ message: "Invalid provider apiKey" });
+  }
+
+  const consentRequest = await prisma.consentRequest.findFirst({
+    where: {
+      id: req.params.id,
+      providerId: provider.id,
+    },
+    include: {
+      decision: true,
+    },
+  });
+
+  if (!consentRequest) {
+    return res.status(404).json({ message: "Consent request not found" });
+  }
+
+  if (consentRequest.status === ConsentRequestStatus.PENDING && consentRequest.expiresAt < new Date()) {
+    await prisma.consentRequest.update({
+      where: { id: consentRequest.id },
+      data: { status: ConsentRequestStatus.EXPIRED },
+    });
+
+    consentRequest.status = ConsentRequestStatus.EXPIRED;
+  }
+
+  await writeAuditLog({
+    action: AuditAction.CONSENT_RESULT_FETCH,
+    userId: consentRequest.userId ?? undefined,
+    metadata: {
+      consentRequestId: consentRequest.id,
+      providerId: provider.id,
+      status: consentRequest.status,
+    },
+  });
+
+  return res.status(200).json({
+    consentRequestId: consentRequest.id,
+    providerId: consentRequest.providerId,
+    userId: consentRequest.userId,
+    requestedAttributes: consentRequest.requestedAttributes,
+    status: consentRequest.status,
+    expiresAt: consentRequest.expiresAt.toISOString(),
+    decision: consentRequest.decision
+      ? {
+          approvedAttributes: consentRequest.decision.approvedAttributes,
+          deniedAttributes: consentRequest.decision.deniedAttributes,
+          decidedAt: consentRequest.decision.decidedAt.toISOString(),
+        }
+      : null,
+  });
+});
+
+v1Router.post("/consent/:id/approve", requireAuth, async (req, res) => {
+  const parsed = approveConsentSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json(zodErrorPayload(parsed.error));
+  }
+
+  const requester = req.auth!;
+  if (requester.registration) {
+    return res.status(403).json({ message: "Access token required" });
+  }
+
+  const consentRequest = await prisma.consentRequest.findUnique({ where: { id: req.params.id } });
+  if (!consentRequest) {
+    return res.status(404).json({ message: "Consent request not found" });
+  }
+
+  if (consentRequest.userId && consentRequest.userId !== requester.userId) {
+    return res.status(403).json({ message: "You cannot decide this consent request" });
+  }
+
+  if (consentRequest.status !== ConsentRequestStatus.PENDING) {
+    return res.status(409).json({ message: "Consent request already decided" });
+  }
+
+  if (consentRequest.expiresAt < new Date()) {
+    await prisma.consentRequest.update({
+      where: { id: consentRequest.id },
+      data: { status: ConsentRequestStatus.EXPIRED },
+    });
+
+    return res.status(410).json({ message: "Consent request expired" });
+  }
+
+  const approvedAttributes = toUniqueAttributes(parsed.data.approvedAttributes);
+  const allowed = new Set(consentRequest.requestedAttributes);
+  const hasUnsupportedAttribute = approvedAttributes.some((item) => !allowed.has(item));
+  if (hasUnsupportedAttribute) {
+    return res.status(400).json({ message: "approvedAttributes must be subset of requestedAttributes" });
+  }
+
+  const deniedAttributes = consentRequest.requestedAttributes.filter(
+    (item) => !approvedAttributes.includes(item),
+  );
+
+  const decided = await prisma.$transaction(async (tx) => {
+    const updated = await tx.consentRequest.update({
+      where: { id: consentRequest.id },
+      data: {
+        status: ConsentRequestStatus.APPROVED,
+        userId: consentRequest.userId ?? requester.userId,
+      },
+    });
+
+    const decision = await tx.consentDecision.create({
+      data: {
+        consentRequestId: consentRequest.id,
+        approvedAttributes,
+        deniedAttributes,
+        decidedAt: new Date(),
+      },
+    });
+
+    return { updated, decision };
+  });
+
+  await writeAuditLog({
+    action: AuditAction.CONSENT_APPROVE,
+    userId: requester.userId,
+    metadata: {
+      consentRequestId: consentRequest.id,
+      providerId: consentRequest.providerId,
+      approvedAttributes,
+      deniedAttributes,
+    },
+  });
+
+  void dispatchConsentWebhook(consentRequest.id);
+
+  return res.status(200).json({
+    consentRequestId: decided.updated.id,
+    status: decided.updated.status,
+    decision: {
+      approvedAttributes: decided.decision.approvedAttributes,
+      deniedAttributes: decided.decision.deniedAttributes,
+      decidedAt: decided.decision.decidedAt.toISOString(),
+    },
+  });
+});
+
+v1Router.post("/consent/:id/deny", requireAuth, async (req, res) => {
+  const parsed = denyConsentSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json(zodErrorPayload(parsed.error));
+  }
+
+  const requester = req.auth!;
+  if (requester.registration) {
+    return res.status(403).json({ message: "Access token required" });
+  }
+
+  const consentRequest = await prisma.consentRequest.findUnique({ where: { id: req.params.id } });
+  if (!consentRequest) {
+    return res.status(404).json({ message: "Consent request not found" });
+  }
+
+  if (consentRequest.userId && consentRequest.userId !== requester.userId) {
+    return res.status(403).json({ message: "You cannot decide this consent request" });
+  }
+
+  if (consentRequest.status !== ConsentRequestStatus.PENDING) {
+    return res.status(409).json({ message: "Consent request already decided" });
+  }
+
+  if (consentRequest.expiresAt < new Date()) {
+    await prisma.consentRequest.update({
+      where: { id: consentRequest.id },
+      data: { status: ConsentRequestStatus.EXPIRED },
+    });
+
+    return res.status(410).json({ message: "Consent request expired" });
+  }
+
+  const deniedAttributes = parsed.data.deniedAttributes
+    ? toUniqueAttributes(parsed.data.deniedAttributes)
+    : consentRequest.requestedAttributes;
+  const allowed = new Set(consentRequest.requestedAttributes);
+  const hasUnsupportedAttribute = deniedAttributes.some((item) => !allowed.has(item));
+  if (hasUnsupportedAttribute) {
+    return res.status(400).json({ message: "deniedAttributes must be subset of requestedAttributes" });
+  }
+
+  const approvedAttributes = consentRequest.requestedAttributes.filter(
+    (item) => !deniedAttributes.includes(item),
+  );
+
+  const decided = await prisma.$transaction(async (tx) => {
+    const updated = await tx.consentRequest.update({
+      where: { id: consentRequest.id },
+      data: {
+        status: ConsentRequestStatus.DENIED,
+        userId: consentRequest.userId ?? requester.userId,
+      },
+    });
+
+    const decision = await tx.consentDecision.create({
+      data: {
+        consentRequestId: consentRequest.id,
+        approvedAttributes,
+        deniedAttributes,
+        decidedAt: new Date(),
+      },
+    });
+
+    return { updated, decision };
+  });
+
+  await writeAuditLog({
+    action: AuditAction.CONSENT_DENY,
+    userId: requester.userId,
+    metadata: {
+      consentRequestId: consentRequest.id,
+      providerId: consentRequest.providerId,
+      approvedAttributes,
+      deniedAttributes,
+    },
+  });
+
+  void dispatchConsentWebhook(consentRequest.id);
+
+  return res.status(200).json({
+    consentRequestId: decided.updated.id,
+    status: decided.updated.status,
+    decision: {
+      approvedAttributes: decided.decision.approvedAttributes,
+      deniedAttributes: decided.decision.deniedAttributes,
+      decidedAt: decided.decision.decidedAt.toISOString(),
+    },
+  });
 });
 
 v1Router.post("/devices/:id/revoke", requireAuth, async (req, res) => {

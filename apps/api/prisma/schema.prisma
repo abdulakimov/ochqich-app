@@ -23,6 +23,13 @@ enum SessionStatus {
   REVOKED
 }
 
+enum ConsentRequestStatus {
+  PENDING
+  APPROVED
+  DENIED
+  EXPIRED
+}
+
 enum AuditAction {
   LOGIN_OK
   LOGIN_FAIL
@@ -31,16 +38,34 @@ enum AuditAction {
   OTP_START
   OTP_VERIFY_OK
   OTP_VERIFY_FAIL
+  CONSENT_REQUEST_CREATE
+  CONSENT_APPROVE
+  CONSENT_DENY
+  CONSENT_RESULT_FETCH
+  CONSENT_WEBHOOK_SENT
+  CONSENT_WEBHOOK_FAIL
 }
 
 model User {
-  id        String    @id @default(cuid())
-  phone     String    @unique
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
-  devices   Device[]
-  sessions  Session[]
-  auditLogs AuditLog[]
+  id              String           @id @default(cuid())
+  phone           String           @unique
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  devices         Device[]
+  sessions        Session[]
+  auditLogs       AuditLog[]
+  consentRequests ConsentRequest[]
+}
+
+model Provider {
+  id              String           @id @default(cuid())
+  name            String
+  apiKey          String           @unique
+  redirectUri     String
+  webhookUrl      String?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  consentRequests ConsentRequest[]
 }
 
 model OtpVerification {
@@ -99,6 +124,36 @@ model Session {
 
   @@index([userId, status])
   @@index([deviceId, status])
+}
+
+model ConsentRequest {
+  id                  String               @id @default(cuid())
+  providerId          String
+  userId              String?
+  requestedAttributes String[]
+  status              ConsentRequestStatus @default(PENDING)
+  expiresAt           DateTime
+  token               String               @unique
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+  provider            Provider             @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  user                User?                @relation(fields: [userId], references: [id], onDelete: SetNull)
+  decision            ConsentDecision?
+
+  @@index([providerId, status])
+  @@index([userId, status])
+  @@index([expiresAt, status])
+}
+
+model ConsentDecision {
+  id                String         @id @default(cuid())
+  consentRequestId  String         @unique
+  approvedAttributes String[]
+  deniedAttributes  String[]
+  decidedAt         DateTime
+  consentRequest    ConsentRequest @relation(fields: [consentRequestId], references: [id], onDelete: Cascade)
+
+  @@index([decidedAt])
 }
 
 model AuditLog {
