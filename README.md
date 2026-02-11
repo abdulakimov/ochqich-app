@@ -8,6 +8,9 @@ Express + Prisma asosidagi auth core:
 - JWT + refresh rotation (`/v1/auth/refresh`)
 - Device revoke (`/v1/devices/:id/revoke`)
 - Audit log (`AuditLog` jadvaliga yoziladi)
+- In-memory rate limiting (`/v1/auth/*`, `/v1/recovery/*`, `/v1/provider/*`)
+- Structured JSON logging (pino uslubidagi) + security headers
+- Health checks: `/health/live`, `/health/ready`, `/health`
 
 ## Tez start (Docker)
 
@@ -110,3 +113,10 @@ curl -s -X POST http://localhost:3000/v1/devices/$DEVICE_ID/revoke \
 - Challenge nonce TTL: 60s.
 - OTP TTL: 300s.
 - Bitta user uchun ACTIVE device limiti: 2 ta (transaction + serializable isolation).
+
+
+## Production hardening
+
+- Multi-stage Docker image (`Dockerfile`)
+- CI pipeline (`.github/workflows/ci.yml`) with lint/test/build
+- Threat model + security checklist: `docs/security-checklist.md`

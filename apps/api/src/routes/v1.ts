@@ -37,6 +37,8 @@ import {
   zodErrorPayload,
 } from "../lib/validation";
 import { requireAuth, requireRecentRevalidation } from "../middleware/auth";
+import { createRateLimitMiddleware } from "../middleware/rate-limit";
+import { logger } from "../lib/logger";
 
 const RECOVERY_OTP_MAX_ATTEMPTS = 5;
 const RECOVERY_CODE_MAX_ATTEMPTS = 5;
@@ -150,7 +152,25 @@ async function dispatchConsentWebhook(consentRequestId: string): Promise<void> {
 
 export const v1Router = Router();
 
-v1Router.post("/auth/register", async (req, res) => {
+const authRateLimiter = createRateLimitMiddleware({
+  name: "auth",
+  windowMs: config.authRateLimitWindowMs,
+  max: config.authRateLimitMax,
+});
+
+const recoveryRateLimiter = createRateLimitMiddleware({
+  name: "recovery",
+  windowMs: config.recoveryRateLimitWindowMs,
+  max: config.recoveryRateLimitMax,
+});
+
+const providerRateLimiter = createRateLimitMiddleware({
+  name: "provider",
+  windowMs: config.providerRateLimitWindowMs,
+  max: config.providerRateLimitMax,
+});
+
+v1Router.post("/auth/register", authRateLimiter, async (req, res) => {
   const parsed = registerOtpSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json(zodErrorPayload(parsed.error));
@@ -188,7 +208,7 @@ v1Router.post("/auth/register", async (req, res) => {
   });
 });
 
-v1Router.post("/auth/verify-otp", async (req, res) => {
+v1Router.post("/auth/verify-otp", authRateLimiter, async (req, res) => {
   const parsed = verifyOtpSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json(zodErrorPayload(parsed.error));
@@ -291,7 +311,7 @@ v1Router.post("/recovery/generate", requireAuth, requireRecentRevalidation, asyn
   return res.status(201).json({ recoveryCodes: recoveryCodes.map((item) => item.plainCode) });
 });
 
-v1Router.post("/recovery/use", async (req, res) => {
+v1Router.post("/recovery/use", recoveryRateLimiter, async (req, res) => {
   const parsed = useRecoveryCodeSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json(zodErrorPayload(parsed.error));
@@ -387,12 +407,12 @@ v1Router.post("/recovery/use", async (req, res) => {
       return res.status(error.status).json({ message: error.message });
     }
 
-    console.error(error);
+    logger.error({ err: error }, "Unhandled route error");
     return res.status(500).json({ message: "Internal server error" });
   }
 });
 
-v1Router.post("/recovery/start-otp", async (req, res) => {
+v1Router.post("/recovery/start-otp", recoveryRateLimiter, async (req, res) => {
   const parsed = recoveryStartOtpSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json(zodErrorPayload(parsed.error));
@@ -435,7 +455,7 @@ v1Router.post("/recovery/start-otp", async (req, res) => {
   });
 });
 
-v1Router.post("/recovery/verify-otp", async (req, res) => {
+v1Router.post("/recovery/verify-otp", recoveryRateLimiter, async (req, res) => {
   const parsed = recoveryVerifyOtpSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json(zodErrorPayload(parsed.error));
@@ -551,7 +571,7 @@ v1Router.post("/recovery/verify-otp", async (req, res) => {
       return res.status(error.status).json({ message: error.message });
     }
 
-    console.error(error);
+    logger.error({ err: error }, "Unhandled route error");
     return res.status(500).json({ message: "Internal server error" });
   }
 });
@@ -632,12 +652,12 @@ v1Router.post("/devices/register", requireAuth, requireRecentRevalidation, async
       return res.status(error.status).json({ message: error.message });
     }
 
-    console.error(error);
+    logger.error({ err: error }, "Unhandled route error");
     return res.status(500).json({ message: "Internal server error" });
   }
 });
 
-v1Router.post("/auth/challenge", async (req, res) => {
+v1Router.post("/auth/challenge", authRateLimiter, async (req, res) => {
   const parsed = challengeSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json(zodErrorPayload(parsed.error));
@@ -670,7 +690,7 @@ v1Router.post("/auth/challenge", async (req, res) => {
   });
 });
 
-v1Router.post("/auth/confirm", async (req, res) => {
+v1Router.post("/auth/confirm", authRateLimiter, async (req, res) => {
   const parsed = confirmSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json(zodErrorPayload(parsed.error));
@@ -774,7 +794,7 @@ v1Router.post("/auth/confirm", async (req, res) => {
   return res.status(200).json({ accessToken, refreshToken });
 });
 
-v1Router.post("/auth/revalidate/challenge", requireAuth, async (req, res) => {
+v1Router.post("/auth/revalidate/challenge", authRateLimiter, requireAuth, async (req, res) => {
   const parsed = challengeSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json(zodErrorPayload(parsed.error));
@@ -829,7 +849,7 @@ v1Router.post("/auth/revalidate/challenge", requireAuth, async (req, res) => {
   });
 });
 
-v1Router.post("/auth/revalidate/confirm", requireAuth, async (req, res) => {
+v1Router.post("/auth/revalidate/confirm", authRateLimiter, requireAuth, async (req, res) => {
   const parsed = confirmSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json(zodErrorPayload(parsed.error));
@@ -929,7 +949,7 @@ v1Router.post("/auth/revalidate/confirm", requireAuth, async (req, res) => {
   return res.status(200).json({ ok: true });
 });
 
-v1Router.post("/auth/refresh", async (req, res) => {
+v1Router.post("/auth/refresh", authRateLimiter, async (req, res) => {
   const parsed = refreshSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json(zodErrorPayload(parsed.error));
@@ -970,7 +990,7 @@ v1Router.post("/auth/refresh", async (req, res) => {
   return res.status(200).json({ accessToken, refreshToken: nextRefreshToken });
 });
 
-v1Router.post("/provider/consent-requests", async (req, res) => {
+v1Router.post("/provider/consent-requests", providerRateLimiter, async (req, res) => {
   const apiKey = getProviderApiKey(req.headers);
   if (!apiKey) {
     return res.status(401).json({ message: "Missing provider apiKey" });
@@ -1037,7 +1057,7 @@ v1Router.post("/provider/consent-requests", async (req, res) => {
   });
 });
 
-v1Router.get("/provider/consent-requests/:id", async (req, res) => {
+v1Router.get("/provider/consent-requests/:id", providerRateLimiter, async (req, res) => {
   const apiKey = getProviderApiKey(req.headers);
   if (!apiKey) {
     return res.status(401).json({ message: "Missing provider apiKey" });
