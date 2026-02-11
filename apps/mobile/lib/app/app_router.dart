@@ -24,7 +24,10 @@ GoRouter buildRouter(AppController controller) {
         return '/pin-setup';
       }
 
-      if (controller.pendingConsent != null && location != '/consent') {
+      if (
+          controller.authenticated &&
+          controller.pendingConsent != null &&
+          location != '/consent') {
         return '/consent';
       }
 
