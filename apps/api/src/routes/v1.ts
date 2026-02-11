@@ -3,6 +3,7 @@ import {
   ChallengeStatus,
   ConsentRequestStatus,
   DeviceStatus,
+  OtpPurpose,
   Prisma,
   SessionStatus,
 } from "@prisma/client";
@@ -24,13 +25,44 @@ import {
   confirmSchema,
   createConsentRequestSchema,
   denyConsentSchema,
+  generateRecoveryCodesSchema,
+  recoveryStartOtpSchema,
+  recoveryVerifyOtpSchema,
   refreshSchema,
   registerDeviceSchema,
   registerOtpSchema,
+  useRecoveryCodeSchema,
   verifyOtpSchema,
   zodErrorPayload,
 } from "../lib/validation";
 import { requireAuth } from "../middleware/auth";
+
+const RECOVERY_OTP_MAX_ATTEMPTS = 5;
+const RECOVERY_CODE_MAX_ATTEMPTS = 5;
+const RECOVERY_RATE_WINDOW_MS = 10 * 60 * 1000;
+
+function generateRecoveryCode(): string {
+  return `${generateOtpCode()}-${generateOtpCode()}`;
+}
+
+async function checkRecoveryRateLimit(scope: "code" | "otp", key: string): Promise<boolean> {
+  const since = new Date(Date.now() - RECOVERY_RATE_WINDOW_MS);
+  const attempts = await prisma.auditLog.count({
+    where: {
+      action:
+        scope === "code"
+          ? { in: [AuditAction.RECOVERY_CODE_USE_FAIL, AuditAction.RECOVERY_RATE_LIMIT_HIT] }
+          : { in: [AuditAction.RECOVERY_OTP_VERIFY_FAIL, AuditAction.RECOVERY_RATE_LIMIT_HIT] },
+      createdAt: { gte: since },
+      metadata: {
+        path: [scope === "code" ? "recoveryCodeHash" : "phone"],
+        equals: key,
+      },
+    },
+  });
+
+  return attempts >= (scope === "code" ? RECOVERY_CODE_MAX_ATTEMPTS : RECOVERY_OTP_MAX_ATTEMPTS);
+}
 
 class HttpError extends Error {
   constructor(
@@ -137,6 +169,7 @@ v1Router.post("/auth/register", async (req, res) => {
       data: {
         phone: parsed.data.phone,
         otpHash,
+        purpose: OtpPurpose.AUTH,
         expiresAt,
       },
     });
@@ -218,6 +251,308 @@ v1Router.post("/auth/verify-otp", async (req, res) => {
     },
     registrationToken,
   });
+});
+
+v1Router.post("/recovery/generate", requireAuth, async (req, res) => {
+  const parsed = generateRecoveryCodesSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return res.status(400).json(zodErrorPayload(parsed.error));
+  }
+
+  const requester = req.auth!;
+  if (requester.registration) {
+    return res.status(403).json({ message: "Access token required" });
+  }
+
+  const count = parsed.data.count ?? 10;
+
+  const recoveryCodes = Array.from({ length: count }, () => {
+    const plainCode = generateRecoveryCode();
+    return { plainCode, codeHash: hashToken(plainCode) };
+  });
+
+  await prisma.$transaction(async (tx) => {
+    await tx.recoveryCode.deleteMany({ where: { userId: requester.userId, usedAt: null } });
+    await tx.recoveryCode.createMany({
+      data: recoveryCodes.map((item) => ({
+        userId: requester.userId,
+        codeHash: item.codeHash,
+      })),
+    });
+  });
+
+  await writeAuditLog({
+    action: AuditAction.RECOVERY_CODE_GENERATE,
+    userId: requester.userId,
+    metadata: { count },
+  });
+
+  return res.status(201).json({ recoveryCodes: recoveryCodes.map((item) => item.plainCode) });
+});
+
+v1Router.post("/recovery/use", async (req, res) => {
+  const parsed = useRecoveryCodeSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json(zodErrorPayload(parsed.error));
+  }
+
+  const recoveryCodeHash = hashToken(parsed.data.recoveryCode);
+  if (await checkRecoveryRateLimit("code", recoveryCodeHash)) {
+    await writeAuditLog({
+      action: AuditAction.RECOVERY_RATE_LIMIT_HIT,
+      metadata: { scope: "code", recoveryCodeHash },
+    });
+    return res.status(429).json({ message: "Too many recovery attempts" });
+  }
+
+  const recoveryCode = await prisma.recoveryCode.findUnique({
+    where: { codeHash: recoveryCodeHash },
+    include: { user: true },
+  });
+
+  if (!recoveryCode || recoveryCode.usedAt) {
+    await writeAuditLog({
+      action: AuditAction.RECOVERY_CODE_USE_FAIL,
+      metadata: { reason: "invalid_or_used", recoveryCodeHash },
+    });
+    return res.status(401).json({ message: "Invalid recovery code" });
+  }
+
+  try {
+    const device = await prisma.$transaction(
+      async (tx) => {
+        const existingDevice = await tx.device.findUnique({
+          where: {
+            userId_fingerprint: {
+              userId: recoveryCode.userId,
+              fingerprint: parsed.data.fingerprint,
+            },
+          },
+        });
+
+        if (existingDevice && existingDevice.status === DeviceStatus.ACTIVE) {
+          throw new HttpError(409, "Device already active");
+        }
+
+        const activeCount = await tx.device.count({
+          where: { userId: recoveryCode.userId, status: DeviceStatus.ACTIVE },
+        });
+
+        if (activeCount >= 2) {
+          throw new HttpError(409, "ACTIVE device limit reached (max 2)");
+        }
+
+        const nextDevice = existingDevice
+          ? await tx.device.update({
+              where: { id: existingDevice.id },
+              data: {
+                status: DeviceStatus.ACTIVE,
+                publicKey: parsed.data.publicKey,
+                deviceName: parsed.data.deviceName,
+              },
+            })
+          : await tx.device.create({
+              data: {
+                userId: recoveryCode.userId,
+                fingerprint: parsed.data.fingerprint,
+                publicKey: parsed.data.publicKey,
+                deviceName: parsed.data.deviceName,
+                status: DeviceStatus.ACTIVE,
+              },
+            });
+
+        await tx.recoveryCode.update({
+          where: { id: recoveryCode.id },
+          data: { usedAt: new Date() },
+        });
+
+        return nextDevice;
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    );
+
+    const registrationToken = signRegistrationToken(recoveryCode.userId);
+
+    await writeAuditLog({
+      action: AuditAction.RECOVERY_CODE_USE_OK,
+      userId: recoveryCode.userId,
+      deviceId: device.id,
+      metadata: { recoveryCodeId: recoveryCode.id },
+    });
+
+    return res.status(200).json({ deviceId: device.id, registrationToken });
+  } catch (error) {
+    if (error instanceof HttpError) {
+      return res.status(error.status).json({ message: error.message });
+    }
+
+    console.error(error);
+    return res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+v1Router.post("/recovery/start-otp", async (req, res) => {
+  const parsed = recoveryStartOtpSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json(zodErrorPayload(parsed.error));
+  }
+
+  const otpCode = generateOtpCode();
+  const otpHash = hashToken(otpCode);
+  const expiresAt = new Date(Date.now() + config.otpTtlSeconds * 1000);
+
+  const otp = await prisma.$transaction(async (tx) => {
+    await tx.otpVerification.updateMany({
+      where: {
+        phone: parsed.data.phone,
+        purpose: OtpPurpose.RECOVERY,
+        verifiedAt: null,
+        expiresAt: { gt: new Date() },
+      },
+      data: { expiresAt: new Date() },
+    });
+
+    return tx.otpVerification.create({
+      data: {
+        phone: parsed.data.phone,
+        otpHash,
+        purpose: OtpPurpose.RECOVERY,
+        expiresAt,
+      },
+    });
+  });
+
+  await writeAuditLog({
+    action: AuditAction.RECOVERY_OTP_START,
+    metadata: { phone: parsed.data.phone, otpId: otp.id },
+  });
+
+  return res.status(201).json({
+    otpId: otp.id,
+    expiresAt: otp.expiresAt.toISOString(),
+    otpCode,
+  });
+});
+
+v1Router.post("/recovery/verify-otp", async (req, res) => {
+  const parsed = recoveryVerifyOtpSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json(zodErrorPayload(parsed.error));
+  }
+
+  if (await checkRecoveryRateLimit("otp", parsed.data.phone)) {
+    await writeAuditLog({
+      action: AuditAction.RECOVERY_RATE_LIMIT_HIT,
+      metadata: { scope: "otp", phone: parsed.data.phone },
+    });
+    return res.status(429).json({ message: "Too many OTP attempts" });
+  }
+
+  const otp = await prisma.otpVerification.findUnique({ where: { id: parsed.data.otpId } });
+
+  if (!otp || otp.phone !== parsed.data.phone || otp.purpose !== OtpPurpose.RECOVERY) {
+    await writeAuditLog({
+      action: AuditAction.RECOVERY_OTP_VERIFY_FAIL,
+      metadata: { reason: "otp_not_found", otpId: parsed.data.otpId, phone: parsed.data.phone },
+    });
+    return res.status(404).json({ message: "Recovery OTP not found" });
+  }
+
+  if (otp.verifiedAt) {
+    return res.status(409).json({ message: "OTP already used" });
+  }
+
+  if (otp.expiresAt < new Date()) {
+    await writeAuditLog({
+      action: AuditAction.RECOVERY_OTP_VERIFY_FAIL,
+      metadata: { reason: "otp_expired", otpId: otp.id, phone: otp.phone },
+    });
+    return res.status(401).json({ message: "OTP expired" });
+  }
+
+  if (hashToken(parsed.data.otpCode) !== otp.otpHash) {
+    await writeAuditLog({
+      action: AuditAction.RECOVERY_OTP_VERIFY_FAIL,
+      metadata: { reason: "invalid_otp", otpId: otp.id, phone: otp.phone },
+    });
+    return res.status(401).json({ message: "Invalid OTP" });
+  }
+
+  const user = await prisma.user.findUnique({ where: { phone: otp.phone } });
+  if (!user) {
+    await writeAuditLog({
+      action: AuditAction.RECOVERY_OTP_VERIFY_FAIL,
+      metadata: { reason: "user_not_found", otpId: otp.id, phone: otp.phone },
+    });
+    return res.status(404).json({ message: "User not found" });
+  }
+
+  try {
+    const device = await prisma.$transaction(
+      async (tx) => {
+        await tx.otpVerification.update({ where: { id: otp.id }, data: { verifiedAt: new Date() } });
+
+        const existingDevice = await tx.device.findUnique({
+          where: {
+            userId_fingerprint: {
+              userId: user.id,
+              fingerprint: parsed.data.fingerprint,
+            },
+          },
+        });
+
+        if (existingDevice && existingDevice.status === DeviceStatus.ACTIVE) {
+          throw new HttpError(409, "Device already active");
+        }
+
+        const activeCount = await tx.device.count({
+          where: { userId: user.id, status: DeviceStatus.ACTIVE },
+        });
+
+        if (activeCount >= 2) {
+          throw new HttpError(409, "ACTIVE device limit reached (max 2)");
+        }
+
+        return existingDevice
+          ? tx.device.update({
+              where: { id: existingDevice.id },
+              data: {
+                status: DeviceStatus.ACTIVE,
+                publicKey: parsed.data.publicKey,
+                deviceName: parsed.data.deviceName,
+              },
+            })
+          : tx.device.create({
+              data: {
+                userId: user.id,
+                fingerprint: parsed.data.fingerprint,
+                publicKey: parsed.data.publicKey,
+                deviceName: parsed.data.deviceName,
+                status: DeviceStatus.ACTIVE,
+              },
+            });
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    );
+
+    const registrationToken = signRegistrationToken(user.id);
+
+    await writeAuditLog({
+      action: AuditAction.RECOVERY_OTP_VERIFY_OK,
+      userId: user.id,
+      deviceId: device.id,
+      metadata: { otpId: otp.id },
+    });
+
+    return res.status(200).json({ deviceId: device.id, registrationToken });
+  } catch (error) {
+    if (error instanceof HttpError) {
+      return res.status(error.status).json({ message: error.message });
+    }
+
+    console.error(error);
+    return res.status(500).json({ message: "Internal server error" });
+  }
 });
 
 v1Router.post("/devices/register", requireAuth, async (req, res) => {
