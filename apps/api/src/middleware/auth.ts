@@ -1,5 +1,5 @@
 import { NextFunction, Request, Response } from "express";
-import { verifyAccessToken } from "../lib/jwt";
+import { RegistrationTokenPayload, verifyToken } from "../lib/jwt";
 import { prisma } from "../lib/prisma";
 
 declare global {
@@ -7,11 +7,21 @@ declare global {
     interface Request {
       auth?: {
         userId: string;
-        deviceId: string;
-        sessionId: string;
+        deviceId?: string;
+        sessionId?: string;
+        registration?: boolean;
       };
     }
   }
+}
+
+function isRegistrationTokenPayload(payload: unknown): payload is RegistrationTokenPayload {
+  return Boolean(
+    payload &&
+      typeof payload === "object" &&
+      "type" in payload &&
+      (payload as RegistrationTokenPayload).type === "registration",
+  );
 }
 
 export async function requireAuth(req: Request, res: Response, next: NextFunction) {
@@ -24,7 +34,16 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
   const token = authHeader.slice(7);
 
   try {
-    const payload = verifyAccessToken(token);
+    const payload = verifyToken(token);
+
+    if (isRegistrationTokenPayload(payload)) {
+      req.auth = {
+        userId: payload.sub,
+        registration: true,
+      };
+
+      return next();
+    }
 
     const session = await prisma.session.findFirst({
       where: {
@@ -43,6 +62,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       userId: payload.sub,
       deviceId: payload.deviceId,
       sessionId: payload.sessionId,
+      registration: false,
     };
 
     return next();

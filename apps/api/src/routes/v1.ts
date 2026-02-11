@@ -1,106 +1,226 @@
+import { AuditAction, ChallengeStatus, DeviceStatus, Prisma, SessionStatus } from "@prisma/client";
 import { Router } from "express";
-import { ChallengeStatus, DeviceStatus, SessionStatus } from "@prisma/client";
 import { config } from "../config";
 import { writeAuditLog } from "../lib/audit";
 import {
   generateNonce,
+  generateOtpCode,
   generateRefreshToken,
   hashToken,
   verifyEd25519Signature,
 } from "../lib/crypto";
-import { signAccessToken } from "../lib/jwt";
+import { signAccessToken, signRegistrationToken } from "../lib/jwt";
 import { prisma } from "../lib/prisma";
 import {
   challengeSchema,
   confirmSchema,
   refreshSchema,
   registerDeviceSchema,
+  registerOtpSchema,
+  verifyOtpSchema,
+  zodErrorPayload,
 } from "../lib/validation";
 import { requireAuth } from "../middleware/auth";
 
+class HttpError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly message: string,
+  ) {
+    super(message);
+  }
+}
+
 export const v1Router = Router();
 
-v1Router.post("/devices/register", async (req, res) => {
-  const parsed = registerDeviceSchema.safeParse(req.body);
+v1Router.post("/auth/register", async (req, res) => {
+  const parsed = registerOtpSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ message: parsed.error.flatten() });
+    return res.status(400).json(zodErrorPayload(parsed.error));
   }
 
-  const { phone, fingerprint, publicKey, deviceName } = parsed.data;
+  const otpCode = generateOtpCode();
+  const otpHash = hashToken(otpCode);
+  const expiresAt = new Date(Date.now() + config.otpTtlSeconds * 1000);
 
-  const user = await prisma.user.upsert({
-    where: { phone },
-    update: {},
-    create: { phone },
-  });
+  const otp = await prisma.$transaction(async (tx) => {
+    await tx.otpVerification.updateMany({
+      where: { phone: parsed.data.phone, verifiedAt: null, expiresAt: { gt: new Date() } },
+      data: { expiresAt: new Date() },
+    });
 
-  const existingDevice = await prisma.device.findUnique({
-    where: {
-      userId_fingerprint: {
-        userId: user.id,
-        fingerprint,
-      },
-    },
-  });
-
-  if (existingDevice && existingDevice.status === DeviceStatus.REVOKED) {
-    const revived = await prisma.device.update({
-      where: { id: existingDevice.id },
+    return tx.otpVerification.create({
       data: {
-        status: DeviceStatus.ACTIVE,
-        publicKey,
-        deviceName,
+        phone: parsed.data.phone,
+        otpHash,
+        expiresAt,
       },
     });
-
-    await writeAuditLog({
-      action: "DEVICE_ADD",
-      userId: user.id,
-      deviceId: revived.id,
-      metadata: { revived: true },
-    });
-
-    return res.status(200).json({ deviceId: revived.id });
-  }
-
-  if (existingDevice) {
-    return res.status(200).json({ deviceId: existingDevice.id });
-  }
-
-  const activeCount = await prisma.device.count({
-    where: {
-      userId: user.id,
-      status: DeviceStatus.ACTIVE,
-    },
-  });
-
-  if (activeCount >= 2) {
-    return res.status(409).json({ message: "ACTIVE device limit reached (max 2)" });
-  }
-
-  const device = await prisma.device.create({
-    data: {
-      userId: user.id,
-      fingerprint,
-      publicKey,
-      deviceName,
-      status: DeviceStatus.ACTIVE,
-    },
   });
 
   await writeAuditLog({
-    action: "DEVICE_ADD",
-    userId: user.id,
-    deviceId: device.id,
+    action: AuditAction.OTP_START,
+    metadata: { phone: parsed.data.phone, otpId: otp.id },
   });
 
-  return res.status(201).json({ deviceId: device.id });
+  return res.status(201).json({
+    otpId: otp.id,
+    expiresAt: otp.expiresAt.toISOString(),
+    otpCode,
+  });
+});
+
+v1Router.post("/auth/verify-otp", async (req, res) => {
+  const parsed = verifyOtpSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json(zodErrorPayload(parsed.error));
+  }
+
+  const otp = await prisma.otpVerification.findUnique({ where: { id: parsed.data.otpId } });
+
+  if (!otp || otp.phone !== parsed.data.phone) {
+    await writeAuditLog({
+      action: AuditAction.OTP_VERIFY_FAIL,
+      metadata: { reason: "otp_not_found", otpId: parsed.data.otpId, phone: parsed.data.phone },
+    });
+    return res.status(404).json({ message: "OTP not found" });
+  }
+
+  if (otp.verifiedAt) {
+    return res.status(409).json({ message: "OTP already used" });
+  }
+
+  if (otp.expiresAt < new Date()) {
+    await writeAuditLog({
+      action: AuditAction.OTP_VERIFY_FAIL,
+      metadata: { reason: "otp_expired", otpId: otp.id, phone: otp.phone },
+    });
+    return res.status(401).json({ message: "OTP expired" });
+  }
+
+  if (hashToken(parsed.data.otpCode) !== otp.otpHash) {
+    await writeAuditLog({
+      action: AuditAction.OTP_VERIFY_FAIL,
+      metadata: { reason: "invalid_otp", otpId: otp.id, phone: otp.phone },
+    });
+    return res.status(401).json({ message: "Invalid OTP" });
+  }
+
+  const user = await prisma.$transaction(async (tx) => {
+    await tx.otpVerification.update({
+      where: { id: otp.id },
+      data: { verifiedAt: new Date() },
+    });
+
+    return tx.user.upsert({
+      where: { phone: otp.phone },
+      update: {},
+      create: { phone: otp.phone },
+    });
+  });
+
+  await writeAuditLog({
+    action: AuditAction.OTP_VERIFY_OK,
+    userId: user.id,
+    metadata: { otpId: otp.id },
+  });
+
+  const registrationToken = signRegistrationToken(user.id);
+
+  return res.status(200).json({
+    user: {
+      id: user.id,
+      phone: user.phone,
+    },
+    registrationToken,
+  });
+});
+
+v1Router.post("/devices/register", requireAuth, async (req, res) => {
+  const parsed = registerDeviceSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json(zodErrorPayload(parsed.error));
+  }
+
+  const requester = req.auth!;
+
+  try {
+    const result = await prisma.$transaction(
+      async (tx) => {
+        const existingDevice = await tx.device.findUnique({
+          where: {
+            userId_fingerprint: {
+              userId: requester.userId,
+              fingerprint: parsed.data.fingerprint,
+            },
+          },
+        });
+
+        if (existingDevice && existingDevice.status === DeviceStatus.ACTIVE) {
+          return { device: existingDevice, created: false, revived: false };
+        }
+
+        const activeCount = await tx.device.count({
+          where: {
+            userId: requester.userId,
+            status: DeviceStatus.ACTIVE,
+          },
+        });
+
+        if (activeCount >= 2) {
+          throw new HttpError(409, "ACTIVE device limit reached (max 2)");
+        }
+
+        if (existingDevice && existingDevice.status === DeviceStatus.REVOKED) {
+          const revived = await tx.device.update({
+            where: { id: existingDevice.id },
+            data: {
+              status: DeviceStatus.ACTIVE,
+              publicKey: parsed.data.publicKey,
+              deviceName: parsed.data.deviceName,
+            },
+          });
+
+          return { device: revived, created: false, revived: true };
+        }
+
+        const created = await tx.device.create({
+          data: {
+            userId: requester.userId,
+            fingerprint: parsed.data.fingerprint,
+            publicKey: parsed.data.publicKey,
+            deviceName: parsed.data.deviceName,
+            status: DeviceStatus.ACTIVE,
+          },
+        });
+
+        return { device: created, created: true, revived: false };
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    );
+
+    await writeAuditLog({
+      action: AuditAction.DEVICE_ADD,
+      userId: requester.userId,
+      deviceId: result.device.id,
+      metadata: { revived: result.revived, created: result.created },
+    });
+
+    return res.status(result.created ? 201 : 200).json({ deviceId: result.device.id });
+  } catch (error) {
+    if (error instanceof HttpError) {
+      return res.status(error.status).json({ message: error.message });
+    }
+
+    console.error(error);
+    return res.status(500).json({ message: "Internal server error" });
+  }
 });
 
 v1Router.post("/auth/challenge", async (req, res) => {
   const parsed = challengeSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ message: parsed.error.flatten() });
+    return res.status(400).json(zodErrorPayload(parsed.error));
   }
 
   const device = await prisma.device.findFirst({
@@ -133,7 +253,7 @@ v1Router.post("/auth/challenge", async (req, res) => {
 v1Router.post("/auth/confirm", async (req, res) => {
   const parsed = confirmSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ message: parsed.error.flatten() });
+    return res.status(400).json(zodErrorPayload(parsed.error));
   }
 
   const challenge = await prisma.authChallenge.findUnique({
@@ -143,7 +263,7 @@ v1Router.post("/auth/confirm", async (req, res) => {
 
   if (!challenge || !challenge.device || challenge.device.status !== DeviceStatus.ACTIVE) {
     await writeAuditLog({
-      action: "LOGIN_FAIL",
+      action: AuditAction.LOGIN_FAIL,
       metadata: { reason: "challenge_or_device_not_found" },
     });
     return res.status(404).json({ message: "Challenge or device not found" });
@@ -151,7 +271,7 @@ v1Router.post("/auth/confirm", async (req, res) => {
 
   if (challenge.status !== ChallengeStatus.PENDING) {
     await writeAuditLog({
-      action: "LOGIN_FAIL",
+      action: AuditAction.LOGIN_FAIL,
       userId: challenge.device.userId,
       deviceId: challenge.deviceId,
       metadata: { reason: "challenge_not_pending" },
@@ -166,7 +286,7 @@ v1Router.post("/auth/confirm", async (req, res) => {
     });
 
     await writeAuditLog({
-      action: "LOGIN_FAIL",
+      action: AuditAction.LOGIN_FAIL,
       userId: challenge.device.userId,
       deviceId: challenge.deviceId,
       metadata: { reason: "challenge_expired" },
@@ -183,7 +303,7 @@ v1Router.post("/auth/confirm", async (req, res) => {
 
   if (!isValid) {
     await writeAuditLog({
-      action: "LOGIN_FAIL",
+      action: AuditAction.LOGIN_FAIL,
       userId: challenge.device.userId,
       deviceId: challenge.deviceId,
       metadata: { reason: "invalid_signature" },
@@ -225,7 +345,7 @@ v1Router.post("/auth/confirm", async (req, res) => {
   });
 
   await writeAuditLog({
-    action: "LOGIN_OK",
+    action: AuditAction.LOGIN_OK,
     userId: challenge.device.userId,
     deviceId: challenge.device.id,
   });
@@ -236,7 +356,7 @@ v1Router.post("/auth/confirm", async (req, res) => {
 v1Router.post("/auth/refresh", async (req, res) => {
   const parsed = refreshSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ message: parsed.error.flatten() });
+    return res.status(400).json(zodErrorPayload(parsed.error));
   }
 
   const refreshTokenHash = hashToken(parsed.data.refreshToken);
@@ -278,6 +398,10 @@ v1Router.post("/devices/:id/revoke", requireAuth, async (req, res) => {
   const targetDeviceId = req.params.id;
   const requester = req.auth!;
 
+  if (requester.registration) {
+    return res.status(403).json({ message: "Access token required" });
+  }
+
   const device = await prisma.device.findFirst({
     where: {
       id: targetDeviceId,
@@ -308,7 +432,7 @@ v1Router.post("/devices/:id/revoke", requireAuth, async (req, res) => {
   });
 
   await writeAuditLog({
-    action: "DEVICE_REVOKE",
+    action: AuditAction.DEVICE_REVOKE,
     userId: requester.userId,
     deviceId: device.id,
   });

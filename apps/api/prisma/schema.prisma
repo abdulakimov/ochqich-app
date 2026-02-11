@@ -28,6 +28,9 @@ enum AuditAction {
   LOGIN_FAIL
   DEVICE_ADD
   DEVICE_REVOKE
+  OTP_START
+  OTP_VERIFY_OK
+  OTP_VERIFY_FAIL
 }
 
 model User {
@@ -38,6 +41,17 @@ model User {
   devices   Device[]
   sessions  Session[]
   auditLogs AuditLog[]
+}
+
+model OtpVerification {
+  id         String   @id @default(cuid())
+  phone      String
+  otpHash    String
+  expiresAt  DateTime
+  verifiedAt DateTime?
+  createdAt  DateTime @default(now())
+
+  @@index([phone, expiresAt])
 }
 
 model Device {

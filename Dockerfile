@@ -2,11 +2,15 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-COPY package.json package-lock.json* ./
+COPY package*.json ./
+COPY apps/api/package*.json ./apps/api/
+COPY packages/shared/package*.json ./packages/shared/
+
 RUN npm install
 
 COPY . .
-RUN npm run prisma:generate && npm run build
+
+RUN npm --prefix apps/api run prisma:generate && npm --prefix apps/api run build
 
 EXPOSE 3000
-CMD ["sh", "-c", "npm run prisma:deploy && npm run start"]
+CMD ["sh", "-c", "npm --prefix apps/api run prisma:deploy && npm --prefix apps/api run start"]

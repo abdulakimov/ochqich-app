@@ -12,5 +12,20 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
 
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ochqich-api
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ochqich?schema=public
+      JWT_SECRET: super-secret-change-me
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
 volumes:
   pgdata:
