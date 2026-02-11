@@ -15,13 +15,7 @@ type RateLimitOptions = {
 const store = new Map<string, RateLimitStoreValue>();
 
 function getClientIp(req: Request): string {
-  const forwarded = req.headers["x-forwarded-for"];
-  if (typeof forwarded === "string" && forwarded.length > 0) {
-    const forwardedIp = forwarded.split(",")[0]?.trim();
-    return forwardedIp && forwardedIp.length > 0 ? forwardedIp : req.ip ?? "unknown";
-  }
-
-  return req.ip ?? "unknown";
+  return req.ip ?? req.socket.remoteAddress ?? "unknown";
 }
 
 function cleanupExpiredEntries(now: number, windowMs: number): void {
