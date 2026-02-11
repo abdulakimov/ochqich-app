@@ -1,3 +1,4 @@
+import { SessionStatus } from "@prisma/client";
 import { NextFunction, Request, Response } from "express";
 import { RegistrationTokenPayload, verifyToken } from "../lib/jwt";
 import { prisma } from "../lib/prisma";
@@ -10,6 +11,7 @@ declare global {
         deviceId?: string;
         sessionId?: string;
         registration?: boolean;
+        lastRevalidatedAt?: Date;
       };
     }
   }
@@ -63,10 +65,39 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       deviceId: payload.deviceId,
       sessionId: payload.sessionId,
       registration: false,
+      lastRevalidatedAt: session.lastRevalidatedAt,
     };
 
     return next();
   } catch {
     return res.status(401).json({ message: "Invalid token" });
   }
+}
+
+const REVALIDATION_WINDOW_MS = 42 * 60 * 60 * 1000;
+
+export async function requireRecentRevalidation(req: Request, res: Response, next: NextFunction) {
+  if (!req.auth || req.auth.registration || !req.auth.sessionId) {
+    return res.status(401).json({ message: "Access token required" });
+  }
+
+  const session = await prisma.session.findUnique({
+    where: { id: req.auth.sessionId },
+    select: {
+      status: true,
+      expiresAt: true,
+      lastRevalidatedAt: true,
+    },
+  });
+
+  if (!session || session.status !== SessionStatus.ACTIVE || session.expiresAt < new Date()) {
+    return res.status(401).json({ message: "Session expired or revoked" });
+  }
+
+  if (session.lastRevalidatedAt.getTime() + REVALIDATION_WINDOW_MS <= Date.now()) {
+    return res.status(403).json({ message: "REVALIDATION_REQUIRED" });
+  }
+
+  req.auth.lastRevalidatedAt = session.lastRevalidatedAt;
+  return next();
 }

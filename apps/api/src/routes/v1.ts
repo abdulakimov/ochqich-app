@@ -1,5 +1,6 @@
 import {
   AuditAction,
+  ChallengePurpose,
   ChallengeStatus,
   ConsentRequestStatus,
   DeviceStatus,
@@ -35,7 +36,7 @@ import {
   verifyOtpSchema,
   zodErrorPayload,
 } from "../lib/validation";
-import { requireAuth } from "../middleware/auth";
+import { requireAuth, requireRecentRevalidation } from "../middleware/auth";
 
 const RECOVERY_OTP_MAX_ATTEMPTS = 5;
 const RECOVERY_CODE_MAX_ATTEMPTS = 5;
@@ -253,7 +254,7 @@ v1Router.post("/auth/verify-otp", async (req, res) => {
   });
 });
 
-v1Router.post("/recovery/generate", requireAuth, async (req, res) => {
+v1Router.post("/recovery/generate", requireAuth, requireRecentRevalidation, async (req, res) => {
   const parsed = generateRecoveryCodesSchema.safeParse(req.body ?? {});
   if (!parsed.success) {
     return res.status(400).json(zodErrorPayload(parsed.error));
@@ -555,7 +556,7 @@ v1Router.post("/recovery/verify-otp", async (req, res) => {
   }
 });
 
-v1Router.post("/devices/register", requireAuth, async (req, res) => {
+v1Router.post("/devices/register", requireAuth, requireRecentRevalidation, async (req, res) => {
   const parsed = registerDeviceSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json(zodErrorPayload(parsed.error));
@@ -752,6 +753,7 @@ v1Router.post("/auth/confirm", async (req, res) => {
         deviceId: challenge.device.id,
         refreshTokenHash,
         expiresAt: refreshExpiresAt,
+        lastRevalidatedAt: new Date(),
         status: SessionStatus.ACTIVE,
       },
     });
@@ -770,6 +772,161 @@ v1Router.post("/auth/confirm", async (req, res) => {
   });
 
   return res.status(200).json({ accessToken, refreshToken });
+});
+
+v1Router.post("/auth/revalidate/challenge", requireAuth, async (req, res) => {
+  const parsed = challengeSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json(zodErrorPayload(parsed.error));
+  }
+
+  const requester = req.auth!;
+  if (requester.registration || !requester.deviceId) {
+    return res.status(403).json({ message: "Access token required" });
+  }
+
+  if (parsed.data.deviceId !== requester.deviceId) {
+    await writeAuditLog({
+      action: AuditAction.REVALIDATE_FAIL,
+      userId: requester.userId,
+      deviceId: requester.deviceId,
+      metadata: { reason: "device_mismatch", requestedDeviceId: parsed.data.deviceId },
+    });
+    return res.status(403).json({ message: "Device mismatch" });
+  }
+
+  const device = await prisma.device.findFirst({
+    where: { id: requester.deviceId, userId: requester.userId, status: DeviceStatus.ACTIVE },
+  });
+
+  if (!device) {
+    await writeAuditLog({
+      action: AuditAction.REVALIDATE_FAIL,
+      userId: requester.userId,
+      deviceId: requester.deviceId,
+      metadata: { reason: "device_not_found" },
+    });
+    return res.status(404).json({ message: "Active device not found" });
+  }
+
+  const nonce = generateNonce();
+  const expiresAt = new Date(Date.now() + config.challengeTtlSeconds * 1000);
+
+  const challenge = await prisma.authChallenge.create({
+    data: {
+      deviceId: device.id,
+      purpose: ChallengePurpose.REVALIDATE,
+      nonce,
+      expiresAt,
+      status: ChallengeStatus.PENDING,
+    },
+  });
+
+  return res.status(201).json({
+    challengeId: challenge.id,
+    nonce,
+    expiresAt: expiresAt.toISOString(),
+  });
+});
+
+v1Router.post("/auth/revalidate/confirm", requireAuth, async (req, res) => {
+  const parsed = confirmSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json(zodErrorPayload(parsed.error));
+  }
+
+  const requester = req.auth!;
+  if (requester.registration || !requester.deviceId || !requester.sessionId) {
+    return res.status(403).json({ message: "Access token required" });
+  }
+
+  const challenge = await prisma.authChallenge.findUnique({
+    where: { id: parsed.data.challengeId },
+    include: { device: true },
+  });
+
+  if (
+    !challenge ||
+    challenge.purpose !== ChallengePurpose.REVALIDATE ||
+    !challenge.device ||
+    challenge.device.status !== DeviceStatus.ACTIVE ||
+    challenge.device.userId !== requester.userId ||
+    challenge.deviceId !== requester.deviceId
+  ) {
+    await writeAuditLog({
+      action: AuditAction.REVALIDATE_FAIL,
+      userId: requester.userId,
+      deviceId: requester.deviceId,
+      metadata: { reason: "challenge_or_device_not_found", challengeId: parsed.data.challengeId },
+    });
+    return res.status(404).json({ message: "Challenge or device not found" });
+  }
+
+  if (challenge.status !== ChallengeStatus.PENDING) {
+    await writeAuditLog({
+      action: AuditAction.REVALIDATE_FAIL,
+      userId: requester.userId,
+      deviceId: requester.deviceId,
+      metadata: { reason: "challenge_not_pending", challengeId: challenge.id },
+    });
+    return res.status(409).json({ message: "Challenge already used or expired" });
+  }
+
+  if (challenge.expiresAt < new Date()) {
+    await prisma.authChallenge.update({
+      where: { id: challenge.id },
+      data: { status: ChallengeStatus.EXPIRED },
+    });
+
+    await writeAuditLog({
+      action: AuditAction.REVALIDATE_FAIL,
+      userId: requester.userId,
+      deviceId: requester.deviceId,
+      metadata: { reason: "challenge_expired", challengeId: challenge.id },
+    });
+
+    return res.status(401).json({ message: "Challenge expired" });
+  }
+
+  const isValid = verifyEd25519Signature(
+    challenge.device.publicKey,
+    challenge.nonce,
+    parsed.data.signature,
+  );
+
+  if (!isValid) {
+    await writeAuditLog({
+      action: AuditAction.REVALIDATE_FAIL,
+      userId: requester.userId,
+      deviceId: requester.deviceId,
+      metadata: { reason: "invalid_signature", challengeId: challenge.id },
+    });
+    return res.status(401).json({ message: "Invalid signature" });
+  }
+
+  await prisma.$transaction(async (tx) => {
+    await tx.authChallenge.update({
+      where: { id: challenge.id },
+      data: {
+        status: ChallengeStatus.USED,
+        usedAt: new Date(),
+      },
+    });
+
+    await tx.session.update({
+      where: { id: requester.sessionId! },
+      data: { lastRevalidatedAt: new Date() },
+    });
+  });
+
+  await writeAuditLog({
+    action: AuditAction.REVALIDATE_OK,
+    userId: requester.userId,
+    deviceId: requester.deviceId,
+    metadata: { challengeId: challenge.id, sessionId: requester.sessionId },
+  });
+
+  return res.status(200).json({ ok: true });
 });
 
 v1Router.post("/auth/refresh", async (req, res) => {
@@ -941,7 +1098,7 @@ v1Router.get("/provider/consent-requests/:id", async (req, res) => {
   });
 });
 
-v1Router.post("/consent/:id/approve", requireAuth, async (req, res) => {
+v1Router.post("/consent/:id/approve", requireAuth, requireRecentRevalidation, async (req, res) => {
   const parsed = approveConsentSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json(zodErrorPayload(parsed.error));
@@ -1030,7 +1187,7 @@ v1Router.post("/consent/:id/approve", requireAuth, async (req, res) => {
   });
 });
 
-v1Router.post("/consent/:id/deny", requireAuth, async (req, res) => {
+v1Router.post("/consent/:id/deny", requireAuth, requireRecentRevalidation, async (req, res) => {
   const parsed = denyConsentSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json(zodErrorPayload(parsed.error));
@@ -1121,7 +1278,7 @@ v1Router.post("/consent/:id/deny", requireAuth, async (req, res) => {
   });
 });
 
-v1Router.post("/devices/:id/revoke", requireAuth, async (req, res) => {
+v1Router.post("/devices/:id/revoke", requireAuth, requireRecentRevalidation, async (req, res) => {
   const targetDeviceId = req.params.id;
   const requester = req.auth!;
 
