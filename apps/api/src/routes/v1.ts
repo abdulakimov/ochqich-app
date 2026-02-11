@@ -556,7 +556,7 @@ v1Router.post("/recovery/verify-otp", async (req, res) => {
   }
 });
 
-v1Router.post("/devices/register", requireAuth, requireRecentRevalidation, async (req, res) => {
+v1Router.post("/devices/register", requireAuth, async (req, res) => {
   const parsed = registerDeviceSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json(zodErrorPayload(parsed.error));
