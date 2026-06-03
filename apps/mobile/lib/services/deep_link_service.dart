@@ -1,19 +1,21 @@
 import 'dart:async';
-
-import 'package:uni_links/uni_links.dart';
+import 'package:app_links/app_links.dart';
 
 class DeepLinkService {
-  StreamSubscription<Object?>? _subscription;
+  final AppLinks _appLinks = AppLinks();
+  StreamSubscription<Uri>? _subscription;
 
   Future<Uri?> getInitialUriSafe() async {
-    return getInitialUri();
+    try {
+      return await _appLinks.getInitialLink();
+    } catch (_) {
+      return null;
+    }
   }
 
   void listen(void Function(Uri uri) onUri) {
-    _subscription = uriLinkStream.listen((Uri? uri) {
-      if (uri != null) {
-        onUri(uri);
-      }
+    _subscription = _appLinks.uriLinkStream.listen((uri) {
+      onUri(uri);
     });
   }
 
